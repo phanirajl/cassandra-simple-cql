@@ -1,9 +1,75 @@
 # Cassandra SimpleCQLMapper
+The SimpleCQLMapper is an abstraction layer on top of Datastax Cassandra driver.
+Many 3rd party ORM mappings are centered around tables. SimpleCQLMapper recognizes that Cassandra data modeling is built around queries, not tables.
+The SimpleCQLMapper consolidates everything related to a particular query in single interface, and converts binding and result mapping into a type-safe access. It does not hide CQL from you like Datastax' query builder, if you are dealing with Cassandra you must know CQL, period.
+Another significant feature of SimpleCQLMapper: it hides complexities of querying rotated tables, if you use them.
+## Configuring and binding (Guice)
+### Binding artifacts
+* MyModule.java, Guice module that ties together configuration pieces
+* MyDao.java, The DAO where you put your Simple CQL code
+* configuration -	configuration settings that go to either config.properties or application defaults. Use prefix "my_prefix" for config settings.
+* CassandraProperties.class, the class that implements prefixed config. this class comes from simplecql library.
+* CassandraClusterConnector.class, the class that manages the Cassandra Session per cluster. This class comes from simplecql library.
+### MyModule
+Module ties together configuration and SimpleCQL artifacts. String constant "my_cluster" is the cluster name. Thereby multiple named Cassandra connections are allowed and possible.
+```
+public class MyModule implements Module
+{
+    @Override
+    public void configure(Binder binder)
+    {
+        // note, if you are using Proofpoint platform, then use:
+        //configBinder(binder).annotatedWith(Names.named("my_cluster")).prefixedWith("my_cluster").to(CassandraProperties.class);
+        binder.bind(CassandraProperties.class).annotatedWith(Names.named("configcenter")).in(Scopes.SINGLETON);
+        binder.bind(MyDAO.class).in(Scopes.SINGLETON);
+    }
+ 
+    @Provides
+    @Singleton
+    @Named("my_cluster")
+    CassandraClusterConnector provideConfigCenterCassandraDao(@Named("my_cluster") CassandraProperties config)
+    {
+        return new CassandraClusterConnector(config);
+    }
+}
+```
+### MyDAO class
+```
+public interface SelectMyContent extends ActivationsPrimaryKey<SelectMyContent>, SimpleCqlMapper<SelectMyContent>
+{
+    SimpleCqlFactory<SelectMyContent> Factory = SimpleCqlFactory.factory(SelectMyContent.class,
+            "SELECT * from  my_keyspace.LABELS WHERE name=? and tenant=? and label=?")
+            .setIdempotent(true)
+            .setConsistencyLevel(ConsistencyLevel.QUORUM);
+}
+ 
+// ... other statements
+ 
+@Inject
+public MyDao(@Named("my_cluster") CassandraClusterConnector connector)
+{
+    this.connector = connector;
+    connector.addConnectListener(this::onConnected);
+}
+ 
+void onConnected(CassandraClusterConnector connector)
+{
+    SelectMyContent.Factory.prepare(connector);
+    // ... other statements
+}
+```
+### Configuration
+The properties can be loaded from external file into CassandraProperties, for example via the Proofpoint platform Configuration machinery. 
+| Property | Description |
+| --- | --- | 
+| cassandra-hosts | comma-separated list of host for you cassandra endpoints
+| cassandra-username | username
+| cassandra-password	| password for the username
+| cassandra-use-ssl |	if true, use SSL
+
 ## Basic Usage
 ### Datamodel
-Consider this simple data model:
-
-### Define the queries
+Consider the following simple data model:
 ```
 CREATE TABLE IF NOT EXIST CONTENT_BY_SHA {
     sha256  blob,
@@ -12,6 +78,12 @@ CREATE TABLE IF NOT EXIST CONTENT_BY_SHA {
     PRIMARY KEY (sha256);
 };
 ```
+### DAO class
+DAO class has 3 sections:
+* defining your queries, where each query is represented by interface you define.
+* initialization section, where queries are prepared during startup
+* data access methods, where you make use of the quesries
+#### Define the query interfaces
 Define your conditional-update query:
 ```
 public interface UpdateContent extends SimpleCqlMapper<UpdateContent>
@@ -48,7 +120,8 @@ public interface SelectContent extends SimpleCqlMapper<SelectContent>
 ```
 Note how the getter names correspond to the select column names.
 
-### Prepare once upon initialization
+#### Prepare once upon initialization
+
 ```
 void onConnected(CassandraClusterConnector connector)
 {
@@ -57,9 +130,12 @@ void onConnected(CassandraClusterConnector connector)
     SelectContent.Factory.prepare(connector);
 }
 ```
-CassandraClusterConnector is a wrapper around Datastax driver's Session object and provides standardized interface with Proofpoint's bootstrap, binding, and configuration facilities. You also have opportunity to set consistency levels and idempotency per statement.
+CassandraClusterConnector is a wrapper around Datastax driver's Session object.
 
-### Updates
+See more on initialization and integration with Guice and PP Platform below.
+
+#### Data access methods
+##### Updates
 Since the update has IF NOT EXIST clause, we want to know whether the update was applied. In this case we can transform the resulting future into boolean via ResultSet::wasApplied.
 ```
 public CompletableFuture<Boolean> updateContent(byte[] sha256, String content, String customer)
@@ -72,7 +148,7 @@ public CompletableFuture<Boolean> updateContent(byte[] sha256, String content, S
         .thenApply(ResultSet::wasApplied);
 }
 ```
-### Selects
+##### Selects
 By default the resulting future will be SelectContent typed but we rather care only about content in this call, so we map the result to a String.
 ```
 public CompletableFuture<Optional<String>> selectContent(byte[] sha256)
@@ -105,7 +181,7 @@ public CompletableFuture<Optional<ContentWithCustomer>> selectContentWithCustome
     return SelectContent.Factory.get().sha256(sha256).executeAsyncAndMapOne();
 }
 ```
-### Selects that return collections
+##### Selects that return collections
 Let's use a table with some clustering columns. Imagine that we store content by hash-customer pair, where sha256 is still the partition key and customer becomes a clustering column.
 ```
 CREATE TABLE IF NOT EXIST CONTENT_BY_SHA {
@@ -124,7 +200,7 @@ public CompletableFuture<Collection<ContentWithCustomer>> selectContentWithCusto
     return SelectContent.Factory.get().sha256(sha256).executeAsyncAndMap();
 }
 ```
-### Selects that return single value
+##### Selects that return single value
 Suppose you want to return a single aggregate value, or a static column from your query method. Use the Optional::map method to re-map the result.
 ```
 public interface SelectCount extends SimpleCqlMapper<SelectCount>
@@ -137,6 +213,23 @@ public CompletableFuture<Optional<Integer>> countOfContent()
 {
     return SelectContent.Factory.get().sha256(sha256).executeAsyncAndMapOne().thenApply(optionalResult -> optionalResult.map(SelectCount::theCount));
 }
+```
+
+#### Using the DAO in the application:
+```
+    @Inject
+    public ECProducerCassandraBackup(EventBackupDAO dao)
+    {
+        this.dao = dao;
+    }
+
+    public void storeBackup(String clusterID, String topic, short partition, byte[] payload)
+    {
+        this.partition = (short) partition;
+
+        TimeUUID cassandraID = TimeUUID.now();
+        storeEventFutures.add(dao.storeEventBackup(clusterID, topic, (short) partition, payload, cassandraID));
+    }
 ```
 ## Table rotation
 Now imagine that our content constantly expires. But because content column is huge, we don't want to use compaction (which causes write amplification). Instead, we want to use a set of round-buffer tables and truncate when table goes out of scope.

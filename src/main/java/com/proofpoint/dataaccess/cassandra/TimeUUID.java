@@ -18,6 +18,9 @@ public final class TimeUUID implements Comparable<TimeUUID>, Comparator<TimeUUID
 
     public TimeUUID(UUID uuid)
     {
+        if (uuid == null || uuid.version() != 1) {
+            throw new UnsupportedOperationException("Not a time-based UUID");
+        }
         this.uuid = uuid;
     }
 

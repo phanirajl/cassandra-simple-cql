@@ -7,11 +7,11 @@
     <artifactId>cassandra-simplecql</artifactId>
     <name>cassandra-simplecql</name>
     <packaging>jar</packaging>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.5-SNAPSHOT</version>
 
     <parent>
         <groupId>com.proofpoint.platform</groupId>
-        <artifactId>platform</artifactId>
+        <artifactId>library</artifactId>
         <version>1.82</version>
     </parent>
 
@@ -100,5 +100,53 @@
             <optional>true</optional>
         </dependency>
     </dependencies>
+
+    <profiles>
+        <profile>
+            <id>release-profile</id>
+            <activation>
+                <property>
+                    <name>performRelease</name>
+                    <value>true</value>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <inherited>true</inherited>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <executions>
+                            <execution>
+                                <id>attach-sources-no-fork</id>
+                                <inherited>true</inherited>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                    <goal>test-jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+
+  <scm>
+    <tag>1.1</tag>
+  </scm>
+
+  <distributionManagement>
+        <repository>
+            <id>proofpoint</id>
+            <name>Proofpoint Releases</name>
+            <url>https://maven.us.proofpoint.com/nexus/content/repositories/yum-centos-generic-release</url>
+        </repository>
+        <snapshotRepository>
+            <id>proofpoint-snapshots</id>
+            <name>Proofpoint Snapshots</name>
+            <url>https://maven.us.proofpoint.com/nexus/content/repositories/yum-centos-generic-snapshot</url>
+        </snapshotRepository>
+  </distributionManagement>
+
 </project>
 

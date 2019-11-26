@@ -1,5 +1,7 @@
 package com.proofpoint.dataaccess.cassandra;
 
+import com.datastax.driver.core.BatchStatement;
+import com.datastax.driver.core.BatchStatement.Type;
 import com.datastax.driver.core.ConsistencyLevel;
 import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
@@ -32,6 +34,7 @@ import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.regex.Matcher;
@@ -63,7 +66,6 @@ import java.util.stream.Stream;
 public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements SimpleCqlProvider<T>
 {
     private static final int MAX_N_TABLES = 400;
-
 
     public interface ByNameAccessor
     {
@@ -123,8 +125,24 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
 
     private BiFunction<Object, String, String> prettyPrinter = this::defaultPrettyPrinter;
 
-    private final Constructor<MethodHandles.Lookup> lookupConstructor;
+    static final Constructor<MethodHandles.Lookup> lookupConstructor;
 
+    static {
+        // the code below is required to bypass limitation "no private access for invokespecial" when invoking default methods
+        Constructor<MethodHandles.Lookup> ctor = null;
+
+        try {
+            ctor = Lookup.class.getDeclaredConstructor(Class.class, int.class);
+        }
+        catch (NoSuchMethodException e) {
+            throw new RuntimeException("SimpleCqlMapper cannot instantiate MethodHandles.Lookup", e);
+        }
+        if (!ctor.isAccessible()) {
+            ctor.setAccessible(true);
+        }
+
+        lookupConstructor = ctor;
+    }
 
     protected SimpleCqlFactory(Class<? extends SimpleCqlMapper> clazz, String query)
     {
@@ -144,7 +162,7 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
             query = replaceNamedParametersPattern.matcher(query).replaceAll("?");
         }
         else {
-            throw new UnsupportedOperationException("SimpleCqlMapper cannot parse query: " + query);
+            throw new UnsupportedOperationException("SimpleCqlMapper "+getMapperName()+" cannot parse query: " + query);
         }
 
         this.query = query;
@@ -161,14 +179,15 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
                     break;
                 }
                 if (!found) {
-                    throw new RuntimeException(clazz.getSimpleName() + " SimpleCqlMapper cannot find setter method " + clazz.getSimpleName() + "." + name);
+                    throw new RuntimeException("SimpleCqlMapper "+getMapperName()+" cannot find setter method " + clazz.getSimpleName() + "." + name);
                 }
             }
         }
         catch (Exception e) {
-            throw new RuntimeException(clazz.getSimpleName() + " SimpleCqlMapper cannot determine retrieve bind index", e);
+            throw new RuntimeException("SimpleCqlMapper "+getMapperName()+" cannot determine retrieve bind index", e);
         }
         Set<Class<?>> binderSuperinterfaces = getSupersRecursively(clazz);
+        binderSuperinterfaces.add(SimpleCql.class);
         bindSupers = binderSuperinterfaces.toArray(new Class<?>[binderSuperinterfaces.size()]);
 
         Class<?> mappedClass = getCqlMapperParameterClass(clazz);
@@ -186,21 +205,6 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
                 getterMethods.put(m.getName(), new GetterHelper(m, getByNameAccessor(m)));
             }
         }
-
-        // the code below is required to bypass limitation "no private access for invokespecial" when invoking default methods
-        Constructor<MethodHandles.Lookup> ctor = null;
-        if (hasDefaultMethods) {
-            try {
-                ctor = Lookup.class.getDeclaredConstructor(Class.class, int.class);
-            }
-            catch (NoSuchMethodException e) {
-                throw new RuntimeException("SimpleCqlMapper cannot instantiate MethodHandles.Lookup", e);
-            }
-            if (!ctor.isAccessible()) {
-                ctor.setAccessible(true);
-            }
-        }
-        lookupConstructor = ctor;
     }
 
     private static Class<?> getCqlMapperParameterClass(Class<? extends SimpleCqlMapper> cl)
@@ -240,6 +244,12 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
         return (byteBuffer == null) ? null : byteBuffer.array();
     }
 
+    static Optional<?> getOptional(Row row, String name)
+    {
+        Object obj = row.getObject(name);
+        return (obj == null)? Optional.empty() : Optional.of(obj);
+    }
+
     ByNameAccessor getByNameAccessor(Method m)
     {
         Class<?> returnType = m.getReturnType();
@@ -248,6 +258,9 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
         }
         if (byte[].class.isAssignableFrom(returnType)) {
             return SimpleCqlFactory::getByteArray;
+        }
+        if (Optional.class.isAssignableFrom(returnType)) {
+            return SimpleCqlFactory::getOptional;
         }
         return Row::getObject;
     }
@@ -338,7 +351,7 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
     public SimpleCqlFactory<T> prepare(CassandraClusterConnector connector)
     {
         if (!isReadyToBePrepared()) {
-            throw new RuntimeException(clazz.getSimpleName() + " SimpleCqlMapper is not ready to prepare query " + query);
+            throw new RuntimeException("SimpleCqlMapper "+getMapperName()+" is not ready to prepare query " + query);
         }
         this.connector = connector;
         maxTableId = numRotations - 1;
@@ -357,7 +370,7 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
                 m.appendTail(sb);
                 q = sb.toString();
                 if (q.equals(query)) {
-                    throw new IllegalArgumentException("The query must contain $(TID) pattern");
+                    throw new IllegalArgumentException(getMapperName()+": The query must contain $(TID) pattern");
                 }
             }
             preparedStatement[n] = connector.getSession().prepare(q);
@@ -434,7 +447,7 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
                 builder.put(me.getKey(), me.getValue().method.invoke(obj));
             }
             catch (Exception e) {
-                throw new IllegalStateException("Exception while accessing " + me.getKey(), e);
+                throw new IllegalStateException("SimpleCqlMapper "+getMapperName()+": Exception while accessing " + me.getKey(), e);
             }
         }
         return builder.build();
@@ -468,6 +481,22 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
         return expirationPeriod(ms, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * Sets whether this statement is idempotent, i.e. whether it can be applied multiple times
+     * without changing the result beyond the initial application.
+     * <p/>
+     * Note: in most cases, Cassandra statements (including upserts) are idempotent.
+     * Examples of non-idempotent statements:<UL>
+     *     <LI>updating Cassandra counters</LI>
+     *     <LI>inserting data where primary key is generated via Cassandra functions like now()</LI>
+     * </UL>
+     *
+     * <p/>
+     * See {@link com.datastax.driver.core.Statement#isIdempotent} for more explanations about this property.
+     *
+     * @param idempotent the new value.
+     * @return this {@code IdempotenceAwarePreparedStatement} object.
+     */
     public SimpleCqlFactory<T> setIdempotent(boolean idempotent)
     {
         this.idempotent = idempotent;
@@ -480,6 +509,12 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
         return this;
     }
 
+    /**
+     * Sets a default serial consistency level. If no serial consistency level is set through this method, the bound statements
+     * created from this object will use the default serial consistency level (SERIAL).
+     * <p/>
+     * See {@link com.datastax.driver.core.PreparedStatement#setSerialConsistencyLevel} for more explanations about this property.
+     */
     public SimpleCqlFactory<T> setSerialConsistencyLevel(ConsistencyLevel consistencyLevel)
     {
         this.serialConsistencyLevel = consistencyLevel;
@@ -572,6 +607,9 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
     @Override
     public T get()
     {
+        if (connector == null) {
+            throw new IllegalStateException("SimpleCqlMapper "+getMapperName()+" has not been prepared");
+        }
         return createBinderProxy((ConfiguredExecution<T>) new ConfiguredExecution(this).optimalExecution());
     }
 
@@ -589,7 +627,7 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
             return (T) Proxy.newProxyInstance(clazz.getClassLoader(), bindSupers, new SimpleCqlHandler(execution));
         }
         catch (Exception e) {
-            throw new RuntimeException(clazz.getSimpleName() + " SimpleCqlMapper cannot create instance of " + clazz.getName());
+            throw new RuntimeException("SimpleCqlMapper "+getMapperName() + " cannot create instance of " + clazz.getName());
         }
     }
 
@@ -626,12 +664,12 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
                                 return prettyPrintMappedObject(proxy, row, (BiFunction<Object, String, String>) args[0]);
                             }
                         }
-                        throw new RuntimeException("SimpleCqlMapper cannot invoke method " + method.toString());
+                        throw new RuntimeException("SimpleCqlMapper "+getMapperName()+" cannot invoke method " + method.toString());
                     }
             );
         }
         catch (Exception e) {
-            throw new RuntimeException(clazz.getSimpleName() + " SimpleCqlMapper cannot create instance of " + clazz.getName(), e);
+            throw new RuntimeException(clazz.getSimpleName() + " SimpleCqlMapper "+getMapperName()+" cannot create instance of " + clazz.getName(), e);
         }
     }
 
@@ -681,9 +719,14 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
         return sb.toString();
     }
 
-    public String getQuery()
+    String getQuery()
     {
         return query;
+    }
+
+    String getMapperName()
+    {
+        return clazz.getSimpleName();
     }
 
     public PreparedStatement getPreparedStatement()
@@ -728,7 +771,7 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
         return (row == null) ? Optional.empty() : Optional.of((M) map(row));
     }
 
-    public <M> Collection<M> mapCollection(ResultSet rs)
+    public <M> List<M> mapCollection(ResultSet rs)
     {
         // TODO: experiment with this code for more optimal async execution
         // below, must use async continuation because there could be blocking I/O calls during iteration
@@ -747,12 +790,40 @@ public final class SimpleCqlFactory<T extends SimpleCqlMapper> implements Simple
 //            return result;
 //        }, executor);
 
-        Collection<M> result = new ArrayList<>();
+        List<M> result = new ArrayList<>();
         // NOTE that this lambda function may issue blocking calls when fetch page is exhausted
         for (Row row : rs) {
             result.add((M) map(row));
         }
         return result;
+    }
+
+    void acquireRequestPermit()
+    {
+        connector.acquireRequestPermit();
+    }
+
+    void releaseRequestPermit()
+    {
+        connector.releaseRequestPermit();
+    }
+
+    public static CompletableFuture<ResultSet> loggedBatchExecAsync(SimpleCqlMapper ... stmts)
+    {
+        // TODO: implement batch for rotating table, restricting only to insert/update/delete
+        BatchStatement batch = new BatchStatement(Type.LOGGED);
+        for (SimpleCqlMapper stmt: stmts) {
+            batch.add(((SimpleCql)stmt).bind0());
+            if (SimpleCqlHandler.logger.isDebugEnabled()) {
+                SimpleCqlHandler.logger.debug("Batch \"%s\" query", ((SimpleCql)stmt).query());
+            }
+        }
+        return ((SimpleCql)stmts[0]).batchExecuteAsync(batch);
+    }
+
+    public static CompletableFuture<Boolean> loggedBatchExecAsyncCheckApplied(SimpleCqlMapper ... stmts)
+    {
+        return loggedBatchExecAsync(stmts).thenApply(ResultSet::wasApplied);
     }
 
     public static class ConfiguredExecution<T1 extends SimpleCqlMapper> implements SimpleCqlProvider<T1>
